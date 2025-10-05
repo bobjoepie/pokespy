@@ -438,6 +438,55 @@
             return matchingSets;
         }
 
+        // Listen for manual price setting messages from popup windows
+        window.addEventListener('message', (event) => {
+            if (event.data && event.data.type === 'POKESPY_SET_MANUAL_PRICE') {
+                const { listingId, price, url } = event.data;
+                debugLog(`📥 Received manual price: $${price} for listing ${listingId}`);
+                
+                // Find the listing element
+                const listingElement = window.pokespyManualEdits?.[listingId];
+                if (!listingElement) {
+                    debugLog('⚠️ Could not find listing element for manual price');
+                    return;
+                }
+                
+                // Create manual price data
+                const manualPriceData = {
+                    cardName: 'Manual Entry',
+                    setName: '',
+                    prices: {
+                        'Ungraded': price,
+                        'PSA 9': null,
+                        'PSA 10': null
+                    },
+                    detectedGrade: null,
+                    extractedCardName: 'Manual',
+                    extractedSetName: '',
+                    imageUrl: null,
+                    pcUrl: url,
+                    isManual: true
+                };
+                
+                // Update or create the price display
+                updatePriceDisplay(listingElement, manualPriceData, null);
+                
+                // Color the eBay price
+                colorEbayPriceBasedOnComparison(listingElement, manualPriceData, null);
+                
+                // Store in cache with manual flag
+                const listingUrl = listingElement.querySelector('a.s-item__link')?.href || '';
+                if (listingUrl) {
+                    storeListingDisplayCache(listingUrl, {
+                        ...manualPriceData,
+                        timestamp: Date.now()
+                    });
+                }
+                
+                debugLog(`✅ Applied manual price: $${price}`);
+            }
+        });
+
         // Card number patterns - easy to add new ones
         const CARD_PATTERNS = [
             {
@@ -1472,6 +1521,69 @@
             }
         }
 
+        // Add Manual Edit button to manually set price from PriceCharting
+        function addManualEditButton(listingElement) {
+            if (listingElement.querySelector('.pricecharting-manual-btn')) return;
+
+            const priceElement = listingElement.querySelector('.s-card__price, .s-item__price, .s-item__price-range, .notranslate');
+            if (!priceElement) return;
+
+            const button = document.createElement('button');
+            button.className = 'pricecharting-manual-btn';
+            button.textContent = '✏️';
+            button.title = 'Manually set price from PriceCharting';
+
+            Object.assign(button.style, {
+                display: 'inline-block',
+                marginLeft: '4px',
+                padding: '2px 6px',
+                background: '#3498db',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                fontSize: '11px',
+                fontWeight: 'bold',
+                verticalAlign: 'middle',
+                cursor: 'pointer',
+                transition: 'background-color 0.2s'
+            });
+
+            if (!document.querySelector('#pricecharting-manual-button-styles')) {
+                const style = document.createElement('style');
+                style.id = 'pricecharting-manual-button-styles';
+                style.textContent = '.pricecharting-manual-btn:hover { background-color: #2980b9 !important; }';
+                document.head.appendChild(style);
+            }
+
+            button.addEventListener('click', async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const originalText = button.textContent;
+                button.textContent = '...';
+                button.disabled = true;
+
+                try {
+                    await openManualPriceEditor(listingElement);
+                } finally {
+                    button.textContent = originalText;
+                    button.disabled = false;
+                }
+            });
+
+            // Insert after the PC📊 (View) button or other buttons
+            const pcViewButton = listingElement.querySelector('.pricecharting-view-btn');
+            const pcDirectButton = listingElement.querySelector('.pricecharting-direct-btn');
+            
+            if (pcDirectButton && pcDirectButton.parentNode) {
+                pcDirectButton.parentNode.insertBefore(button, pcDirectButton.nextSibling);
+            } else if (pcViewButton && pcViewButton.parentNode) {
+                pcViewButton.parentNode.insertBefore(button, pcViewButton.nextSibling);
+            } else {
+                priceElement.parentNode.insertBefore(button, priceElement.nextSibling);
+            }
+        }
+
         // Calculate title similarity function (referenced in searchTCGdex)
         function calculateTitleSimilarity(ebayTitle, cardName) {
             if (!ebayTitle || !cardName) return 0;
@@ -2017,6 +2129,137 @@
             }
         }
 
+        // Function to open manual price editor
+        async function openManualPriceEditor(listingElement) {
+            try {
+                const listingInfo = extractListingInfo(listingElement);
+                debugLog('🔧 Opening manual price editor for:', listingInfo.title);
+
+                // Open PriceCharting in a new window
+                const searchQuery = encodeURIComponent(listingInfo.title || '');
+                const pcWindow = window.open(
+                    `https://www.pricecharting.com/search?q=${searchQuery}&type=prices`,
+                    'pcManualEditor',
+                    'width=1200,height=800,scrollbars=yes,resizable=yes'
+                );
+
+                if (!pcWindow) {
+                    alert('Please allow popups for this site to use the manual price editor.');
+                    return;
+                }
+
+                // Create a unique ID for this listing
+                const listingId = listingElement.getAttribute('data-gr') || 
+                                 listingElement.getAttribute('id') || 
+                                 `listing-${Date.now()}`;
+
+                // Store the listing element reference
+                window.pokespyManualEdits = window.pokespyManualEdits || {};
+                window.pokespyManualEdits[listingId] = listingElement;
+
+                // Inject a script into the popup window to add "Set Price" buttons
+                const injectionScript = `
+                    (function() {
+                        const listingId = '${listingId}';
+                        
+                        function addSetPriceButtons() {
+                            // Find all price elements on PriceCharting
+                            const priceElements = document.querySelectorAll('.price, .used_price, td:has(a[href*="/game/"])');
+                            
+                            priceElements.forEach((el) => {
+                                if (el.querySelector('.pokespy-set-price-btn')) return;
+                                
+                                // Try to extract price
+                                const priceText = el.textContent.trim();
+                                const priceMatch = priceText.match(/\\$([\\d,]+\\.?\\d*)/);
+                                
+                                if (priceMatch) {
+                                    const price = priceMatch[1].replace(',', '');
+                                    
+                                    const btn = document.createElement('button');
+                                    btn.className = 'pokespy-set-price-btn';
+                                    btn.textContent = '✓ Use This';
+                                    btn.style.cssText = \`
+                                        margin-left: 8px;
+                                        padding: 4px 8px;
+                                        background: #27ae60;
+                                        color: white;
+                                        border: none;
+                                        border-radius: 3px;
+                                        font-size: 11px;
+                                        font-weight: bold;
+                                        cursor: pointer;
+                                        transition: background 0.2s;
+                                    \`;
+                                    
+                                    btn.onmouseover = () => btn.style.background = '#229954';
+                                    btn.onmouseout = () => btn.style.background = '#27ae60';
+                                    
+                                    btn.onclick = () => {
+                                        // Send message to opener window
+                                        if (window.opener && !window.opener.closed) {
+                                            window.opener.postMessage({
+                                                type: 'POKESPY_SET_MANUAL_PRICE',
+                                                listingId: listingId,
+                                                price: parseFloat(price),
+                                                url: window.location.href
+                                            }, '*');
+                                            
+                                            btn.textContent = '✓ Set!';
+                                            btn.style.background = '#2ecc71';
+                                            setTimeout(() => window.close(), 1000);
+                                        }
+                                    };
+                                    
+                                    el.appendChild(btn);
+                                }
+                            });
+                        }
+                        
+                        // Add buttons when page loads
+                        if (document.readyState === 'loading') {
+                            document.addEventListener('DOMContentLoaded', addSetPriceButtons);
+                        } else {
+                            addSetPriceButtons();
+                        }
+                        
+                        // Re-add buttons after any DOM changes (for dynamic content)
+                        setTimeout(addSetPriceButtons, 1000);
+                        setTimeout(addSetPriceButtons, 2000);
+                    })();
+                `;
+
+                // Wait for the popup to load, then inject the script
+                const checkInterval = setInterval(() => {
+                    if (pcWindow.closed) {
+                        clearInterval(checkInterval);
+                        return;
+                    }
+                    
+                    try {
+                        if (pcWindow.document && pcWindow.document.readyState === 'complete') {
+                            clearInterval(checkInterval);
+                            const script = pcWindow.document.createElement('script');
+                            script.textContent = injectionScript;
+                            pcWindow.document.body.appendChild(script);
+                        }
+                    } catch (e) {
+                        // Cross-origin error - can't inject, but that's okay
+                        clearInterval(checkInterval);
+                    }
+                }, 100);
+
+                // Clean up after 5 minutes
+                setTimeout(() => {
+                    clearInterval(checkInterval);
+                }, 300000);
+
+            } catch (error) {
+                debugLog('❌ Error opening manual price editor:', error);
+                alert('Error opening price editor: ' + error.message);
+            }
+        }
+
 
         // --- Enhanced helper function for PriceCharting URL creation with all logic ---
         async function createPriceChartingUrl(cardNumber, setNumber, requestKey, listingElement, showPricePage) {
@@ -2523,6 +2766,11 @@
                 timeoutId = setTimeout(checkForData, 1000); // Wait 1 second before first check
                 listenerControl.timeoutId = timeoutId;
             });
+        }
+
+        // Wrapper function for updating price display (used by manual edit and automatic updates)
+        function updatePriceDisplay(listingElement, pcData, detectedGrade) {
+            updateListingWithPriceChartingData(listingElement, pcData);
         }
 
         // Update listing with PriceCharting data - Enhanced version with grade detection
@@ -3114,11 +3362,14 @@
                                     addGooglePriceChartingButton(listing, info.title);
                                     addPriceChartingViewButton(listing, info.cardNumber, info.setNumber, info.matchedPattern);
                                     addPriceChartingDirectButton(listing, info.cardNumber, info.setNumber, info.matchedPattern);
+                                    addManualEditButton(listing);
                                 } else if (info.setName) {
                                     addGooglePriceChartingButton(listing, info.title);
                                     addPriceChartingDirectButton(listing, null, null, 'title-based');
+                                    addManualEditButton(listing);
                                 } else {
                                     addGooglePriceChartingButton(listing, info.title);
+                                    addManualEditButton(listing);
                                 }
                             } else {
                                 // Display exists, but update price comparison dynamically
@@ -3157,13 +3408,16 @@
                         addGooglePriceChartingButton(listing, info.title);
                         addPriceChartingViewButton(listing, info.cardNumber, info.setNumber, info.matchedPattern);
                         addPriceChartingDirectButton(listing, info.cardNumber, info.setNumber, info.matchedPattern);
+                        addManualEditButton(listing);
                     } else if (info.setName) {
                         // No card number, but we have set name - add title-based search button
                         debugLog(`✅ Adding title-based search button for set: ${info.setName}`);
                         addGooglePriceChartingButton(listing, info.title);
                         addPriceChartingDirectButton(listing, null, null, 'title-based');
+                        addManualEditButton(listing);
                     } else {
                         addGooglePriceChartingButton(listing, info.title);
+                        addManualEditButton(listing);
                     }
                 }
 
